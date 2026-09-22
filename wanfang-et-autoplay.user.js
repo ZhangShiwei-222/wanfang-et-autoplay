@@ -2,8 +2,8 @@
 // @name         万方科研诚信培训 - 后台自动刷课
 // @name:zh-CN   万方科研诚信培训 - 后台自动刷课
 // @namespace    https://cx.wanfangdata.com.cn/e-training/
-// @version      1.5.0
-// @description  防切页暂停 + 自动播放 + 倍速 + 静音开关 + 播完自动下一节，支持后台挂机
+// @version      1.7.4
+// @description  防切页暂停 + 自动播放 + 倍速 + 静音 + 自动下一节 + 活动跨课程同标签自动续播
 // @author       Boss
 // @match        https://cx.wanfangdata.com.cn/e-training/*
 // @run-at       document-start
@@ -44,7 +44,8 @@
     enabled: store.get('enabled', true),      // 总开关
     antiPause: store.get('antiPause', true),  // 防切页
     autoPlay: store.get('autoPlay', true),    // 自动播放
-    autoNext: store.get('autoNext', true),    // 自动下一节
+    autoNext: store.get('autoNext', true),    // 自动下一节（课程内跨章）
+    autoCourse: store.get('autoCourse', true),// 跨课程自动续播（活动场景）
     autoNextDelay: store.get('autoNextDelay', 2), // 播完后延时切节（秒）
     speed: store.get('speed', 1),             // 倍速
     mute: store.get('mute', false),           // 静音（默认关 = 有声）
@@ -56,6 +57,7 @@
     store.set('antiPause', CFG.antiPause);
     store.set('autoPlay', CFG.autoPlay);
     store.set('autoNext', CFG.autoNext);
+    store.set('autoCourse', CFG.autoCourse);
     store.set('autoNextDelay', CFG.autoNextDelay);
     store.set('speed', CFG.speed);
     store.set('mute', CFG.mute);
@@ -64,7 +66,20 @@
 
   const log = (...a) => console.log('%c[万方刷课]', 'color:#4DBA87;font-weight:bold', ...a);
 
-  /* ================= 1. 防切页（仅拦截 visibilitychange 事件，最小干预） ================= */
+  // 跨标签页/跨页面状态（原始值）
+  const gm = {
+    get(k, d) { try { if (typeof GM_getValue === 'function') { const v = GM_getValue(k); return v == null ? d : v; } } catch (e) {} return d; },
+    set(k, v) { try { if (typeof GM_setValue === 'function') GM_setValue(k, v); } catch (e) {} }
+  };
+
+  // 页面类型
+  const PAGE = {
+    activity: /\/activity\/info/.test(location.pathname),
+    intro: /introduction/.test(location.pathname),
+    learn: /courselearn|courselive|livelearn|\/video/.test(location.href),
+  };
+
+  /* ================= 1. 防切页 ================= */
   function installAntiPause() {
     if (!CFG.antiPause) return;
     window.addEventListener('visibilitychange', (e) => {
@@ -90,7 +105,6 @@
     } catch (e) {}
   }
 
-  // 应用静音设置：mute=true 强制静音；false 恢复有声。每秒校准，对抗播放器重置。
   function applyMute(video) {
     if (!video) return;
     try { video.muted = CFG.mute; } catch (e) {}
@@ -102,8 +116,6 @@
     const p = video.play();
     if (p && p.catch) {
       p.catch(() => {
-        // 有声自动播放被浏览器拦截 → 临时静音起播（保证能播起来）
-        // 下一秒 applyMute 会按 CFG.mute 校正：默认 false 会恢复有声
         try { video.muted = true; } catch (e) {}
         const p2 = video.play();
         if (p2 && p2.catch) p2.catch(() => {});
@@ -111,13 +123,16 @@
     }
   }
 
-  /* ================= 3. 自动下一节 ================= */
+  /* ================= 3. 自动下一节（课程内跨章） ================= */
   function goNext() {
-    const btn = document.querySelector('.right .next');
-    if (btn) {
-      btn.click();
-      log('自动切换到下一节');
-      return true;
+    const selectors = ['.right .next', 'span.next'];
+    for (const sel of selectors) {
+      const btn = document.querySelector(sel);
+      if (btn && !btn.classList.contains('next-no-active')) {
+        btn.click();
+        log('自动切换到下一节（' + sel + '）');
+        return true;
+      }
     }
     const spans = [];
     document.querySelectorAll('.children-item').forEach((item) => {
@@ -138,10 +153,26 @@
   /* ================= 4. 主循环 ================= */
   let handledVideo = null;
   let nextTimer = null;
+  let nextTriggered = false;
+
+  function triggerNext(reason) {
+    if (nextTriggered) return;
+    if (!CFG.autoNext || !CFG.enabled) return;
+    nextTriggered = true;
+    log('检测到本节结束，准备切下一节（' + reason + '）');
+    if (nextTimer) clearTimeout(nextTimer);
+    nextTimer = setTimeout(() => {
+      nextTimer = null;
+      if (!CFG.enabled) { nextTriggered = false; return; }
+      const ok = goNext();
+      if (!ok) nextTriggered = false;
+    }, CFG.autoNextDelay * 1000);
+  }
 
   function handleVideo(video) {
     if (!video || handledVideo === video) return;
     handledVideo = video;
+    nextTriggered = false;
 
     applySpeed(video);
     applyMute(video);
@@ -150,38 +181,109 @@
     video.addEventListener('canplay', () => { tryPlay(video); }, true);
 
     video.addEventListener('ended', () => {
-      log('当前节播放结束');
-      if (CFG.autoNext && CFG.enabled) {
-        if (nextTimer) clearTimeout(nextTimer);
-        nextTimer = setTimeout(() => {
-          nextTimer = null;
-          if (CFG.enabled) goNext();
-        }, CFG.autoNextDelay * 1000);
-      }
+      log('ended 事件触发');
+      triggerNext('ended事件');
     });
 
     tryPlay(video);
     log('已接管播放器');
   }
 
-  /* 检测播放器是否缺失（返回提示文本，不写 DOM） */
+  /* ================= 5. 跨课程自动续播（同标签闭环） ================= */
+  let closeHandled = false;
+
+  function findUnfinishedCourse() {
+    const items = document.querySelectorAll('.course-item');
+    for (const item of items) {
+      const img = item.querySelector('.course-right img');
+      if (img && (img.getAttribute('src') || '').indexOf('course-uncomplete') >= 0) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  // 拦截 window.open：课程跳转改为同标签，规避浏览器弹窗拦截
+  function installWindowOpenInterceptor() {
+    const origOpen = window.open;
+    window.open = function (url) {
+      if (typeof url === 'string' && /introduction/.test(url)) {
+        location.href = url;
+        return window;
+      }
+      return origOpen.apply(window, arguments);
+    };
+  }
+
+  // 活动列表页：自动进入未完成课程
+  let activityClicked = false;
+  function activityTick() {
+    if (!CFG.enabled || !CFG.autoCourse) return;
+    if (activityClicked) return;
+    const item = findUnfinishedCourse();
+    if (item) {
+      activityClicked = true;
+      gm.set('wf_et_learning', String(Date.now()));
+      item.click(); // courseInfo → window.open(被拦截) → location.href 同标签跳转
+      log('自动进入下一门课程');
+    } else {
+      log('所有课程已学完 ✓');
+    }
+  }
+
+  // 介绍页：自动点"立即学习"进入学习页（无条件，只要开了自动续播）
+  let introClicked = false;
+  function introTick() {
+    if (!CFG.enabled || !CFG.autoCourse) return;
+    if (introClicked) return;
+    const btn = document.querySelector('.studySoon-btn') || document.querySelector('.study-btn');
+    if (btn) {
+      introClicked = true;
+      btn.click();
+      log('自动进入学习页（从第一章开始，已学完的自动快进跳过）');
+    }
+  }
+
+  // 学习页：最后一节播完 → 自动返回活动列表
+  function checkCourseFinish(video) {
+    if (!CFG.enabled || !CFG.autoCourse) return;
+    if (closeHandled) return;
+    if (!gm.get('wf_et_learning', '')) return; // 非自动流程，不干预
+    const hasNext = !!document.querySelector('.right .next');
+    if (hasNext) return; // 还有下一节，交给 triggerNext
+    if (!video) return;
+    const finished = video.ended || (video.duration > 0 && isFinite(video.duration) && (video.duration - video.currentTime) < 2);
+    if (!finished) return;
+    closeHandled = true;
+    log('本课程已学完，返回活动列表');
+    gm.set('wf_et_learning', '');
+    setTimeout(() => {
+      const aid = gm.get('wf_et_aid', '');
+      if (aid) {
+        location.href = '/e-training/activity/info?aId=' + aid + '&_t=' + Date.now();
+      } else {
+        window.close();
+      }
+    }, 2000);
+  }
+
+  /* 检测播放器是否缺失 */
   let missCount = 0;
   function playerMissingText(video) {
-    const isLearnPage = /courselearn|courselive|livelearn|\/video/.test(location.href);
     const hasBar = !!document.querySelector('.right .next, .right .last');
-    if (isLearnPage && hasBar && !video) {
+    if (PAGE.learn && hasBar && !video) {
       missCount++;
     } else {
       missCount = 0;
       return '';
     }
     if (missCount >= 20) {
-      return '⚠ 未检测到播放器。若视频一直不出现，多为阿里云播放器SDK(g.alicdn.com)加载失败（网络/代理问题，与本脚本无关）。可关闭脚本强刷对比，或 F12→Network 搜 aliplayer 看是否有失败请求。';
+      return '⚠ 未检测到播放器。多为阿里云播放器SDK(g.alicdn.com)加载失败（网络/代理），与本脚本无关。F12→Network 搜 aliplayer 看是否有失败请求。';
     }
     return '';
   }
 
-  /* ================= 5. 面板 ================= */
+  /* ================= 6. 面板 ================= */
   let panel = null;
   let lastWarn = '';
   let lastProg = '';
@@ -200,6 +302,7 @@
         <div class="wf-et-row"><span class="wf-et-k">总开关</span><label class="wf-et-sw"><input type="checkbox" id="wf-et-enabled"><i></i></label></div>
         <div class="wf-et-row"><span class="wf-et-k">防切页</span><label class="wf-et-sw"><input type="checkbox" id="wf-et-antiPause"><i></i></label></div>
         <div class="wf-et-row"><span class="wf-et-k">自动下一节</span><label class="wf-et-sw"><input type="checkbox" id="wf-et-autoNext"><i></i></label></div>
+        <div class="wf-et-row"><span class="wf-et-k">跨课程续播</span><label class="wf-et-sw"><input type="checkbox" id="wf-et-autoCourse"><i></i></label></div>
         <div class="wf-et-row"><span class="wf-et-k">静音</span><label class="wf-et-sw"><input type="checkbox" id="wf-et-mute"><i></i></label></div>
         <div class="wf-et-row"><span class="wf-et-k">倍速</span>
           <div class="wf-et-speeds" id="wf-et-speeds">
@@ -208,7 +311,7 @@
         </div>
         <div class="wf-et-row"><span class="wf-et-k">进度</span><span class="wf-et-prog" id="wf-et-prog">--:-- / --:--</span></div>
         <button class="wf-et-next" id="wf-et-next">下一节 ▶</button>
-        <p class="wf-et-tip">提示：系统按「真实学习时长」判定完成（约90%），1倍速后台挂机最稳。</p>
+        <p class="wf-et-tip">跨课程续播：在活动「课程列表」页开着即可，自动依次学完每门课程（同标签内跳转）。</p>
       </div>
     `;
     document.body.appendChild(panel);
@@ -223,6 +326,7 @@
     bind('wf-et-enabled', 'enabled');
     bind('wf-et-antiPause', 'antiPause');
     bind('wf-et-autoNext', 'autoNext');
+    bind('wf-et-autoCourse', 'autoCourse');
     bind('wf-et-mute', 'mute', () => applyMute(findVideo()));
 
     $('wf-et-next').onclick = () => goNext();
@@ -271,7 +375,6 @@
     return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
-  // 面板 DOM 更新（幂等：内容不变则不写）
   function refreshPanel(video, warnText) {
     if (!panel) return;
     if (warnText !== lastWarn) {
@@ -295,10 +398,11 @@
     const v = document.querySelector('video');
     const containers = [...document.querySelectorAll('[id^="inPlayer"]')].map(el => el.id);
     console.log('%c[万方刷课·诊断]', 'color:#e67e22;font-weight:bold', {
-      video元素: v ? { readyState: v.readyState, paused: v.paused, muted: v.muted, currentTime: v.currentTime, duration: v.duration, src: (v.currentSrc || '').slice(0, 100) } : '不存在',
+      页面类型: PAGE,
+      video元素: v ? { readyState: v.readyState, paused: v.paused, muted: v.muted, currentTime: v.currentTime, duration: v.duration } : '不存在',
       播放器容器: containers.length ? containers : '不存在',
-      hidden: document.hidden,
-      visibilityState: document.visibilityState,
+      learning: gm.get('wf_et_learning', ''),
+      aid: gm.get('wf_et_aid', ''),
       页面URL: location.href,
     });
     log('诊断信息已输出，可截图反馈');
@@ -331,6 +435,7 @@
   /* ================= 启动 ================= */
   function boot() {
     installAntiPause();
+    installWindowOpenInterceptor();
 
     const applyStyle = () => {
       if (typeof GM_addStyle === 'function') { try { GM_addStyle(CSS); return; } catch (e) {} }
@@ -343,7 +448,22 @@
     const onReady = () => {
       if (CFG.showPanel && document.body) buildPanel();
 
-      // 唯一主循环：低频轮询，纯只读 + 幂等写面板，杜绝自触发循环
+      // 记录活动 ID（跨课程返回用）
+      if (PAGE.activity) {
+        const aid = new URLSearchParams(location.search).get('aId');
+        if (aid) gm.set('wf_et_aid', aid);
+        // 监听课程点击（手动或自动），统一记录"学习中"状态，确保跨课程闭环
+        document.addEventListener('click', (e) => {
+          const item = e.target.closest('.course-item');
+          if (item && CFG.enabled && CFG.autoCourse) {
+            gm.set('wf_et_aid', aid);
+            gm.set('wf_et_learning', String(Date.now()));
+            log('记录：正在学习一门课程');
+          }
+        }, true);
+      }
+
+      // 主循环：播放控制 + 切节 + 课程完成检测
       const tick = () => {
         if (!CFG.enabled) return;
         const v = findVideo();
@@ -351,13 +471,36 @@
           if (handledVideo !== v) handleVideo(v);
           applySpeed(v);
           applyMute(v);
+          // 持续保播：切节后/暂停时自动恢复播放（后台切节 play 可能被拒，每秒重试）
+          if (CFG.autoPlay && v.paused && !v.ended) {
+            tryPlay(v);
+          }
+          if (v.duration && isFinite(v.duration) && v.duration > 0) {
+            const finished = v.ended || (!v.paused && (v.duration - v.currentTime) < 2);
+            if (finished) triggerNext('进度轮询');
+          }
+          checkCourseFinish(v);
         } else {
           handledVideo = null;
+          nextTriggered = false;
         }
         refreshPanel(v, playerMissingText(v));
       };
       setInterval(tick, 1000);
-      log('v1.5.0 已启动');
+
+      // 活动列表页：自动进入未完成课程
+      if (PAGE.activity) {
+        setInterval(activityTick, 3000);
+        activityTick();
+      }
+
+      // 介绍页：自动进入学习
+      if (PAGE.intro) {
+        setInterval(introTick, 2000);
+        setTimeout(introTick, 2000);
+      }
+
+      log('v1.7.4 已启动');
     };
 
     if (document.readyState === 'loading') {
